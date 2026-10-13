@@ -1,0 +1,6 @@
+.git
+http/iso/*.iso
+tftp
+.env
+*.md
+.DS_Store

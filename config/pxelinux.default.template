@@ -1,0 +1,6 @@
+DEFAULT menu.c32
+MENU TITLE PXE Boot Menu (BIOS/Legacy)
+PROMPT 0
+TIMEOUT 100
+
+# 以下菜单项由 entrypoint 按 http/iso/ 下的镜像动态追加

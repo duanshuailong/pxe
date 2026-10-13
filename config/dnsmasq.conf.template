@@ -1,0 +1,31 @@
+port=0
+interface=${PXE_INTERFACE}
+bind-interfaces
+
+# 客户端架构打标签（DHCP option 93 client-arch）：
+#   0      = BIOS x86
+#   7 / 9  = UEFI x86_64
+#   11     = UEFI arm64
+dhcp-match=set:bios,option:client-arch,0
+dhcp-match=set:efi-x86_64,option:client-arch,7
+dhcp-match=set:efi-x86_64,option:client-arch,9
+dhcp-match=set:efi-arm64,option:client-arch,11
+
+# 是否已经进入 iPXE（iPXE 会在 DHCP 里带 user-class "iPXE"）
+dhcp-userclass=set:ipxe,iPXE
+
+enable-tftp
+tftp-root=/srv/tftp
+# VMware UEFI 固件对大 TFTP 块有 bug，强制 512 字节块防二进制损坏
+tftp-no-blocksize
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+# 日志输出到 stderr → docker logs（容器里没有 syslog，不加这行 DHCP/TFTP 日志会丢）
+log-facility=-
+log-dhcp
+
+# 以下由 entrypoint 按 DHCP_MODE / PXE_FIRMWARE 追加：
+#   full  -> dhcp-range=<IF>,<start>,<end>,<mask>,<lease>
+#   proxy -> dhcp-range=<network>,proxy
+# 引导走 iPXE 链载：
+#   未进 iPXE: BIOS→undionly.kpxe, UEFI→ipxe.efi
+#   已进 iPXE: →http://<IP>:<PORT>/boot.ipxe（HTTP 直取内核，绕过 grub/shim）

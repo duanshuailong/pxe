@@ -1,0 +1,402 @@
+#cloud-config
+autoinstall:
+  version: 1
+  # 设置语言
+  locale: en_US.UTF-8
+  # 设置时区
+  timezone: Asia/Shanghai
+  keyboard:
+    layout: us
+  # 安装ubuntu服务器版，最小化选择 ubuntu-mini
+  # source:
+    # id: ubuntu-server
+    # search_drivers: false
+  source:
+    id: ubuntu-server-minimal
+    search_drivers: false
+  # 网络配置,根据具体接口名称修改。
+  #network:
+  #  version: 2
+  #  ethernets:
+  #    all:
+  #      match:
+  #        name: "en*"
+  #      dhcp4: true
+  # 是否安装第三方驱动
+  drivers:
+    install: false
+  # 内核安装，linux-generic 通用内核
+  kernel:
+    package: linux-generic
+  # 设置存储库，这里使用阿里云
+  apt:
+    fallback: offline-install
+    timeout: 1200
+    mirror-selection:
+      primary:
+      - arches: [amd64]
+        uri: http://mirrors.aliyun.com/ubuntu/
+      - arches: [arm64]
+        uri: http://mirrors.aliyun.com/ubuntu-ports
+    preserve_sources_list: false
+  # 配置存储，分区
+  storage:
+    config:
+    - {ptable: gpt, wipe: superblock, preserve: false, name: '', grub_device: false, type: disk, id: disk-sda, path: DISK0}
+    - {device: disk-sda, size: 1024M, wipe: superblock, flag: boot, number: 1, preserve: false, grub_device: true, type: partition, id: partition-0}
+    - {fstype: fat32, volume: partition-0, preserve: false, type: format, id: format-0}
+    - {device: disk-sda, size: -1, wipe: superblock, number: 2, preserve: false, grub_device: false, type: partition, id: partition-1}
+    - {fstype: xfs, volume: partition-1, preserve: false, type: format, id: format-1}
+    - {device: format-0, path: /boot/efi, type: mount, id: mount-0}
+    - {device: format-1, path: /, type: mount, id: mount-1}
+  # 配置账号信息
+  identity:
+    hostname: HOSTNAME_1
+    username: user
+    # 1
+    password: $6$7L1jb2datVKmIKTw$2HqT2xLVaVgbTjSPwXk3pSDwZ2ITEkJaQu63CpBHSs67V4Rh7o4Kp1azeAJE/1y0wdGLZztjlAHJjMjcAx.tx1
+
+  # ssg 配置
+  ssh:
+    allow-pw: true
+    authorized-keys:
+      - ""
+    install-server: true
+  # 软件安装
+  # packages:
+  #   - vim
+  #   - git
+  early-commands:
+    # - mdadm -S /dev/md* || true
+    # - mdadm --zero-superblock /dev/sda || true
+    # - mdadm --zero-superblock /dev/sdb || true
+    - lvremove /dev/ubuntu-vg/ubuntu-lv -f || true
+    - vgremove ubuntu-vg || true
+    # ══════════════════════════════════════════════════════════════════
+    # 第一步：枚举并选择目标盘（300G–1200G，排除 U 盘和安装介质）
+    # 优先级：SATA（rotational=1）> NVMe（rotational=0），只选 1 块系统盘
+    # 选中的盘写入 /run/target-disks.txt，单行一个 /dev/sdX 或 /dev/nvmeXn1
+    # ══════════════════════════════════════════════════════════════════
+    - |
+      # set -e
+      MIN_GB=300
+      MAX_GB=2000
+      NEED=1
+      LOG()  { echo "[disk-select] $*"; }
+      FAIL() { echo "[disk-select] ERROR: $*" >&2; exit 1; }
+
+      # 检查安装介质：ISO/VFAT/UDF
+      is_install_media() {
+        blkid "$1" 2>/dev/null | grep -qE "iso9660|udf|vfat"
+      }
+
+      LOG "===== 第一步：选择目标硬盘 ====="
+
+      # 清空结果文件
+      > /run/target-disks.txt
+
+      # 逐行枚举所有裸盘
+      # 字段: NAME SIZE ROTA RM TRAN
+      lsblk -d --bytes --noheadings -o NAME,SIZE,ROTA,RM,TRAN 2>/dev/null | while read -r name size_b rota rm tran; do
+        [ -z "$name" ] && continue
+        dev="/dev/$name"
+        [ -b "$dev" ] || continue
+
+        # ── 过滤条件 ──
+        # 1. 排除可移动设备（U 盘/移动硬盘）
+        [ "$rm" = "1" ] && LOG "  排除 (可移动): $dev" && continue
+        # 2. 排除 USB 总线设备
+        [ "$tran" = "usb" ] && LOG "  排除 (USB): $dev" && continue
+        # 3. 排除安装介质（ISO/VFAT/UDF）
+        if is_install_media "$dev"; then
+          LOG "  排除 (安装介质): $dev"
+          continue
+        fi
+        # 4. 容量过滤
+        size_gb=${size_b:-0}
+        size_gb=$(( size_gb / 1024 / 1024 / 1024 )) 2>/dev/null || size_gb=0
+        if [ "$size_gb" -lt "$MIN_GB" ] || [ "$size_gb" -gt "$MAX_GB" ]; then
+          LOG "  排除 (容量 ${size_gb}G 不在 ${MIN_GB}G-${MAX_GB}G): $dev"
+          continue
+        fi
+
+        LOG "  可用: $dev  容量=${size_gb}G  rotational=$rota  tran=$tran"
+        # 写入临时文件暂存
+        echo "$dev|$size_gb|$rota" >> /run/disk-candidates.txt
+      done
+
+      # 读取候选盘，按 SATA/NVMe 分组
+      > /run/disk-sata.txt
+      > /run/disk-nvme.txt
+      if [ -f /run/disk-candidates.txt ]; then
+        while read -r entry; do
+          [ -z "$entry" ] && continue
+          rota=$(echo "$entry" | cut -d'|' -f3)
+          if [ "$rota" = "1" ]; then
+            echo "$entry" >> /run/disk-sata.txt
+          else
+            echo "$entry" >> /run/disk-nvme.txt
+          fi
+        done < /run/disk-candidates.txt
+      fi
+
+      # ── 从分组中取容量最小的 1 块，优先 SATA ──
+      pick_group() {
+        local group_file=$1
+        local label=$2
+        local count
+        count=$(wc -l < "$group_file" 2>/dev/null || echo 0)
+        [ "$count" -lt "$NEED" ] && return 1
+
+        # 按容量升序排序，取最小的 NEED 块
+        sort -t'|' -k2 -n "$group_file" | head -n "$NEED"
+      }
+
+      target_sata=$(pick_group /run/disk-sata.txt "SATA")
+      target_nvme=$(pick_group /run/disk-nvme.txt "NVMe")
+
+      TARGET_DISK0=""
+      > /run/target-disks.txt
+
+      if [ -n "$target_sata" ]; then
+        echo "$target_sata" | head -n "$NEED" | while read -r line; do
+          disk=$(echo "$line" | cut -d'|' -f1)
+          size_gb=$(echo "$line" | cut -d'|' -f2)
+          LOG "选中 SATA ${size_gb}G: $disk"
+          echo "$disk" >> /run/target-disks.txt
+        done
+      elif [ -n "$target_nvme" ]; then
+        echo "$target_nvme" | head -n "$NEED" | while read -r line; do
+          disk=$(echo "$line" | cut -d'|' -f1)
+          size_gb=$(echo "$line" | cut -d'|' -f2)
+          LOG "选中 NVMe ${size_gb}G: $disk"
+          echo "$disk" >> /run/target-disks.txt
+        done
+      fi
+
+      # 验证恰好有 1 块
+      disk_count=$(wc -l < /run/target-disks.txt 2>/dev/null || echo 0)
+      [ "$disk_count" -lt "$NEED" ] && FAIL "未找到符合条件的 SATA 或 NVMe 系统硬盘"
+
+      # 打印结果
+      LOG "===== 选中的目标硬盘 ====="
+      while read -r disk; do
+        [ -z "$disk" ] && continue
+        size_b=$(lsblk -bdn -o SIZE -n "$disk" 2>/dev/null || echo 0)
+        size_gb=$(( size_b / 1024 / 1024 / 1024 )) 2>/dev/null || size_gb=0
+        rota=$(lsblk -dn -o ROTA -n "$disk" 2>/dev/null || echo 1)
+        [ "$rota" = "1" ] && type_str="SATA" || type_str="NVMe"
+        LOG "  $disk  ${size_gb}G  $type_str"
+      done < /run/target-disks.txt
+      LOG "========================================="
+
+    # ══════════════════════════════════════════════════════════════════
+    # 第二步：清除选中盘上所有 RAID 痕迹
+    # ══════════════════════════════════════════════════════════════════
+    - |
+      # set -e
+      LOG()  { echo "[raid-clean-disk] $*"; }
+      FAIL() { echo "[raid-clean-disk] ERROR: $*" >&2; exit 1; }
+
+      [ -f /run/target-disks.txt ] || FAIL "/run/target-disks.txt 不存在"
+      disk_count=$(wc -l < /run/target-disks.txt 2>/dev/null || echo 0)
+      [ "$disk_count" -lt 1 ] && FAIL "目标硬盘不足 1 块"
+
+      LOG "===== 第二步：清除选中盘的 RAID 痕迹 ====="
+
+      while read -r disk; do
+        [ -z "$disk" ] && continue
+        [ -b "$disk" ] || { LOG "  $disk 不存在，跳过"; continue; }
+
+        LOG "处理 $disk ..."
+
+        # ── 停止该盘分区参与的 md 阵列 ──
+        for part in "$disk" "${disk}"[0-9]* "${disk}p"[0-9]*; do
+          [ -b "$part" ] || continue
+          # 检查是否属于某个 md（从 /proc/mdstat 找设备名）
+          md_assoc=$(grep -E "$(basename "$part")$" /proc/mdstat 2>/dev/null | awk '{print $1}' | head -1 || true)
+          if [ -n "$md_assoc" ] && [ -b "/dev/$md_assoc" ]; then
+            LOG "  停止 $disk 上的 RAID /dev/$md_assoc ..."
+            mdadm --stop "/dev/$md_assoc" 2>/dev/null || true
+          fi
+        done
+
+        # ── 逐分区清 superblock ──
+        for part in "$disk" "${disk}"[0-9]* "${disk}p"[0-9]*; do
+          [ -b "$part" ] || continue
+          if mdadm --examine "$part" 2>/dev/null | grep -q "Linux.*raid"; then
+            LOG "  清 superblock: $part"
+            mdadm --zero-superblock "$part" 2>/dev/null || true
+          fi
+        done
+
+        # ── 刷新分区表 ──
+        LOG "  刷新分区表: $disk"
+        partprobe "$disk" 2>/dev/null || true
+        LOG "  $disk 清完毕"
+      done < /run/target-disks.txt
+
+      LOG "========================================="
+
+    # ══════════════════════════════════════════════════════════════════
+    # 三步：清理 md0 / md1（若有其他 RAID 占用了这两个名称，全部清掉）
+    # ══════════════════════════════════════════════════════════════════
+    - |
+      # set -e
+      LOG()  { echo "[raid-clean-md] $*"; }
+
+      LOG "===== 第三步：清理 md0 / md1 ====="
+
+      for md in /dev/md0 /dev/md1; do
+        if [ ! -b "$md" ]; then
+          LOG "  $md 不存在，跳过"
+          continue
+        fi
+
+        LOG "  发现 $md 存在，清空中 RAID ..."
+        members=$(mdadm --detail "$md" 2>/dev/null | \
+                   awk '/\/dev\// && !/^\/dev\/md/ {print $NF}' || true)
+        [ -n "$members" ] && LOG "    成员盘: $members"
+
+        mdadm --stop "$md" 2>/dev/null || true
+
+        for member in $members; do
+          if [ -b "$member" ]; then
+            LOG "    清 superblock: $member"
+            mdadm --zero-superblock "$member" 2>/dev/null || true
+          fi
+        done
+
+        # 强制 kernel 释放 md 编号
+        mdn=$(basename "$md")
+        echo "idle" > "/sys/block/$mdn/md/array_state" 2>/dev/null || true
+        LOG "  $md 清完毕"
+      done
+
+      # 全局扫描：300G-1200G 非安装介质的盘，是否还有 md 残留
+      lsblk -d --bytes --noheadings -o NAME,SIZE 2>/dev/null | while read -r name size_b; do
+        [ -z "$name" ] && continue
+        dev="/dev/$name"
+        size_gb=${size_b:-0}
+        size_gb=$(( size_gb / 1024 / 1024 / 1024 )) 2>/dev/null || continue
+        [ "$size_gb" -lt 300 ] || [ "$size_gb" -gt 2000 ] && continue
+        blkid "$dev" 2>/dev/null | grep -qE "iso9660|vfat|udf" && continue
+        for part in "$dev" "${dev}"[0-9]* "${dev}p"[0-9]*; do
+          [ -b "$part" ] || continue
+          if grep -q "$(basename "$part")" /proc/mdstat 2>/dev/null; then
+            mdname=$(grep "$(basename "$part")" /proc/mdstat | awk '{print $1}' | head -1 || true)
+            if [ -n "$mdname" ] && [ -b "/dev/$mdname" ]; then
+              LOG "  发现残留关联 /dev/$mdname -> $part，一并清理 ..."
+              mdadm --stop "/dev/$mdname" 2>/dev/null || true
+              mdadm --zero-superblock "$part" 2>/dev/null || true
+            fi
+          fi
+        done
+      done
+
+      LOG "========================================="
+      LOG "所有 RAID 清理完成，系统已就绪"
+      LOG "========================================="
+
+    # ══════════════════════════════════════════════════════════════════
+    # 第四步：把 storage.config 中的 DISK0 占位符替换为真实路径
+    # ══════════════════════════════════════════════════════════════════
+    - |
+      # set -e
+      LOG()  { echo "[storage-path] $*"; }
+      FAIL() { echo "[storage-path] ERROR: $*" >&2; exit 1; }
+
+      AUTOINSTALL="/autoinstall.yaml"
+      [ -f /run/target-disks.txt ] || FAIL "/run/target-disks.txt 不存在"
+      disk_count=$(wc -l < /run/target-disks.txt 2>/dev/null || echo 0)
+      [ "$disk_count" -lt 1 ] && FAIL "目标硬盘不足 1 块"
+
+      DISK0=$(sed -n '1p' /run/target-disks.txt)
+      [ -z "$DISK0" ] && FAIL "读取目标硬盘路径失败"
+
+      LOG "disk-sda = $DISK0"
+
+      # 路径中含 / 和 &，必须转义；用 # 做 sed 分隔符避免与路径冲突
+      DISK0_ESC=$(echo "$DISK0" | sed 's/[\/&]/\\&/g')
+
+      sed -i "s#path: DISK0#path: $DISK0_ESC#g" "$AUTOINSTALL"
+      LOG "storage.config 路径替换完成"
+
+  late-commands:
+    # ssh 密钥
+    - mkdir -p /target/root/.ssh && echo "" >/target/root/.ssh/authorized_keys
+    # 允许root登录
+    - curtin in-target --target=/target -- sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    # 修改 sysctl.conf arp内核参数
+    - |
+      curtin in-target --target=/target -- bash -c 'cat > /etc/sysctl.conf <<EOF
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+      net.ipv4.conf.eth2.rp_filter = 0
+      net.ipv4.conf.eth3.rp_filter = 0
+      net.ipv4.conf.bond0.rp_filter = 0
+      net.ipv4.conf.all.arp_announce = 2
+      net.ipv4.conf.all.arp_ignore = 1
+      net.ipv4.conf.default.accept_source_route = 0
+      net.ipv4.conf.default.arp_announce = 2
+      net.ipv4.conf.default.arp_ignore = 1
+      EOF'
+    # 安装依赖包
+    - curtin in-target --target=/target -- bash -c 'echo "deb [trusted=yes] file:///cdrom/debs ./" | tee /etc/apt/sources.list.d/local-repo.list'
+    - curtin in-target --target=/target -- bash -c 'cd /etc/apt/sources.list.d/; mv ubuntu.sources ubuntu.sources.bak'
+    - curtin in-target --target=/target -- apt update || true
+    # 编译相关
+    - curtin in-target --target=/target -- apt install -y make gcc debhelper bison flex dkms pkg-config libtool gfortran
+    # 基础包
+    - curtin in-target --target=/target -- apt install -y cron dnsutils iputils-ping tcpdump vim rsyslog net-tools ipmitool lldpd dmidecode kdump-tools isc-dhcp-client
+    - curtin in-target --target=/target -- systemctl enable lldpd
+
+    # 固定内核版本
+    - curtin in-target --target=/target -- apt-mark hold $(uname -r)
+    # 禁用 apt 自动更新
+    - |
+      curtin in-target --target=/target -- bash -c 'cat > /etc/apt/apt.conf.d/10periodic <<EOF
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Download-Upgradeable-Packages "0";
+      APT::Periodic::AutocleanInterval "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      EOF'
+    - |
+      curtin in-target --target=/target -- bash -c 'cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Download-Upgradeable-Packages "0";
+      APT::Periodic::AutocleanInterval "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      EOF'
+    # 写入网络配置到 /etc/netplan/mgmt.yaml.bak
+    - |
+      curtin in-target --target=/target -- bash -c 'cat > /etc/netplan/00-default.yaml <<EOF
+      network:
+        ethernets:
+          all:
+            match:
+              name: "en*"
+            dhcp4: true
+      EOF'
+
+    # 禁用网络自动配置
+    - |
+      curtin in-target --target=/target -- bash -c "cat <<EOF > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+      network: {config: disabled}
+      EOF"
+    # 安装 Mellanox 网卡驱动
+    #- curtin in-target --target=/target -- bash /cdrom/scripts/network_driver.sh
+    # install doca driver
+    # - curtin in-target --target=/target -- dpkg -i /cdrom/debs/doca/*.deb  >/doca.log 2>&1
+    - curtin in-target --target=/target -- bash -c 'apt install -y doca-all > /doca.log 2>&1'
+    - curtin in-target --target=/target -- bash -c 'systemctl enable openibd'
+    # 安装 NVIDIA GPU 驱动
+    - curtin in-target --target=/target -- bash /cdrom/scripts/gpu_driver.sh
+    - curtin in-target --target=/target -- dpkg -i /cdrom/debs/nvidia/*.deb || true
+    - curtin in-target --target=/target -- systemctl daemon-reload
+    - curtin in-target --target=/target -- systemctl enable nvidia-fabricmanager || true
+
+    #- curtin in-target --target=/target -- python3 /tmp/generate-doca-management-udev.py || true
+    - curtin in-target --target=/target -- bash -c 'rm /etc/apt/sources.list.d/local-repo.list'
+    - curtin in-target --target=/target -- bash -c 'cd /etc/apt/sources.list.d/; mv ubuntu.sources.bak ubuntu.sources'
+

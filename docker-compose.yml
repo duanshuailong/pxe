@@ -1,0 +1,31 @@
+# PXE 必须使用 host 网络：DHCP 依赖广播，桥接/NAT 无法正确工作。
+# 因此 ports: 在此无效，容器直接占用宿主机 67/udp、69/udp、4011/udp、HTTP_PORT。
+# 宿主机文件一律放在 /var/pxe（由 .env 的 PXE_ROOT 指定）。
+
+services:
+  pxe:
+    build: .
+    image: pxe-server:22.04
+    container_name: pxe
+    restart: unless-stopped
+    network_mode: host
+    # init: 用 docker 自带 init(tini) 回收僵尸进程、转发信号给监督脚本
+    init: true
+    stop_grace_period: 15s
+    env_file:
+      - .env
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+    volumes:
+      # :z 给 Rocky/RHEL SELinux 打容器共享标签
+      - ${PXE_ROOT}/http:/var/www/html:z
+      - ${PXE_ROOT}/tftp:/srv/tftp:z
+      - ${PXE_ROOT}/config:/opt/pxe/config:ro,z
+    healthcheck:
+      # HTTP 能应答即视为健康；dnsmasq 崩溃由 entrypoint 的监督循环兜底重启
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${HTTP_PORT:-8080}/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

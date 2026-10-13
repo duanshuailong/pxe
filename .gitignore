@@ -1,0 +1,14 @@
+.env
+*.iso
+http/iso/*.iso
+tftp/vmlinuz
+tftp/initrd
+tftp/pxelinux.0
+tftp/bootx64.efi
+tftp/grubx64.efi
+tftp/*.c32
+tftp/unicode.pf2
+tftp/pxelinux.cfg/default
+tftp/grub/grub.cfg
+.DS_Store
+.claude/

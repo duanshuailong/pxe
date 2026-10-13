@@ -1,0 +1,58 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  timezone: Asia/Shanghai
+  keyboard:
+    layout: us
+  source:
+    id: ubuntu-server
+    search_drivers: false
+  network:
+    version: 2
+    ethernets:
+      all-en:
+        match:
+          name: en*
+        dhcp4: true
+  drivers:
+    install: false
+  kernel:
+    package: linux-generic
+  apt:
+    disable_components: []
+    fallback: offline-install
+    geoip: true
+    mirror-selection:
+      primary:
+        - arches: [amd64]
+          uri: http://mirrors.aliyun.com/ubuntu/
+        - arches: [arm64]
+          uri: http://mirrors.aliyun.com/ubuntu-ports
+    preserve_sources_list: false
+  # Legacy/BIOS: 需要 bios_grub 分区，磁盘 grub_device: true
+  storage:
+    config:
+      - {ptable: gpt, path: /dev/sda, wipe: superblock-recursive, preserve: false, name: '', grub_device: true, type: disk, id: disk-sda}
+      - {device: disk-sda, size: 1M, flag: bios_grub, number: 1, preserve: false, type: partition, id: partition-0}
+      - {device: disk-sda, size: 300M, wipe: superblock, flag: '', number: 2, preserve: false, type: partition, id: partition-1}
+      - {device: disk-sda, size: -1, wipe: superblock, flag: '', number: 3, preserve: false, type: partition, id: partition-2}
+      - {fstype: ext4, volume: partition-1, preserve: false, type: format, id: format-0}
+      - {fstype: ext4, volume: partition-2, preserve: false, type: format, id: format-1}
+      - {device: format-0, path: /boot, type: mount, id: mount-0}
+      - {device: format-1, path: /, type: mount, id: mount-1}
+  identity:
+    hostname: host000
+    # 用户名: user  密码: 1
+    password: $6$7L1jb2datVKmIKTw$2HqT2xLVaVgbTjSPwXk3pSDwZ2ITEkJaQu63CpBHSs67V4Rh7o4Kp1azeAJE/1y0wdGLZztjlAHJjMjcAx.tx1
+    realname: user
+    username: user
+  ssh:
+    allow-pw: true
+    install-server: true
+  packages:
+    - ipmitool
+  late-commands:
+    - curtin in-target --target=/target -- apt-get -y update
+    - sed -i "s/1/0/g" /target/etc/apt/apt.conf.d/10periodic
+    - sed -i "s/1/0/g" /target/etc/apt/apt.conf.d/20auto-upgrades

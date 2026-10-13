@@ -1,0 +1,18 @@
+default=0
+set timeout=10
+
+if loadfont unicode ; then
+  set gfxmode=auto
+  set locale_dir=$prefix/locale
+  set lang=en_US
+fi
+terminal_output gfxterm
+
+if background_color 44,0,30; then
+  clear
+fi
+
+set menu_color_normal=white/black
+set menu_color_highlight=black/light-gray
+
+# 以下菜单项由 entrypoint 按 http/iso/ 下的镜像动态追加
